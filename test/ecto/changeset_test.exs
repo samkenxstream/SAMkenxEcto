@@ -95,6 +95,7 @@ defmodule Ecto.ChangesetTest do
       field :decimal, :decimal
       field :upvotes, :integer, default: 0
       field :topics, {:array, :string}
+      field :seo_metadata, :map
       field :virtual, :string, virtual: true
       field :published_at, :naive_datetime
       field :source, :map
@@ -119,7 +120,7 @@ defmodule Ecto.ChangesetTest do
   end
 
   defp changeset(schema \\ %Post{}, params) do
-    cast(schema, params, ~w(id token title author_email body upvotes decimal color topics virtual)a)
+    cast(schema, params, ~w(id token title author_email body upvotes decimal color topics seo_metadata virtual)a)
   end
 
   defmodule CustomError do
@@ -364,6 +365,47 @@ defmodule Ecto.ChangesetTest do
     changeset = cast(struct, params, ~w(custom_error)a)
     assert changeset.errors == [custom_error: {"custom error message", [type: Ecto.ChangesetTest.CustomError, validation: :cast, reason: :foobar]}]
     refute changeset.valid?
+  end
+
+  test "cast/4: user-defined error message overrides default invalid error message" do
+    params = %{"title" => 1, "body" => 2}
+    struct = %Post{}
+    custom_errors = [title: "must be a string"]
+    msg_func = fn field, _ -> custom_errors[field] end
+
+    changeset = cast(struct, params, ~w(title body)a, message: msg_func)
+    assert changeset.changes == %{}
+
+    assert changeset.errors == [
+             title: {"must be a string", [type: :string, validation: :cast]},
+             body: {"is invalid", [type: :string, validation: :cast]}
+           ]
+
+    refute changeset.valid?
+  end
+
+  test "cast/4: user-defined error message overrides custom invalid error message" do
+    params = %{"custom_error" => :error}
+    struct = %CustomErrorTest{}
+    msg_func = fn _, _ -> "user-defined error" end
+
+    changeset = cast(struct, params, ~w(custom_error)a, message: msg_func)
+
+    assert changeset.errors == [custom_error: {"user-defined error", [type: Ecto.ChangesetTest.CustomError, validation: :cast, reason: :foobar]}]
+    refute changeset.valid?
+  end
+
+  test "cast/4: :message must be a function of arity 2" do
+    params = %{"title" => 1, "body" => 2}
+    struct = %Post{}
+    custom_errors = [title: "must be a string"]
+    msg_func = fn field -> custom_errors[field] end
+
+    msg = ~r/expected `:message` to be a function of arity 2/
+
+    assert_raise ArgumentError, msg, fn ->
+      cast(struct, params, ~w(title body)a, message: msg_func)
+    end
   end
 
   test "cast/4: ignores the :type parameter in custom errors" do
@@ -692,6 +734,56 @@ defmodule Ecto.ChangesetTest do
 
     assert_raise ArgumentError, ~r"must be atoms, got: `\"bad\"`", fn ->
       change(post, %{"bad" => 42})
+    end
+  end
+
+  test "changed?/3 " do
+    post = %Post{}
+
+    changeset = change(post,
+      title: "title",
+      upvotes: nil,
+      author_email: "johndoe@example.com",
+      comment: %Comment{}
+    )
+
+    assert changed?(changeset, :title)
+    assert changed?(changeset, :upvotes)
+    assert changed?(changeset, :comment)
+    refute changed?(changeset, :comments)
+    refute changed?(changeset, :body)
+
+    # :to
+    assert changed?(changeset, :title, to: "title")
+    assert changed?(changeset, :upvotes, to: nil)
+    assert changed?(changeset, :author_email, to: "johndoe+1@example.com")
+    refute changed?(changeset, :title, to: "wrong")
+    refute changed?(changeset, :body, to: nil)
+
+    # :from
+    assert changed?(changeset, :title, from: "")
+    assert changed?(changeset, :upvotes, from: 0)
+    refute changed?(changeset, :title, from: "wrong")
+    refute changed?(changeset, :author_email, to: "johndoee@example.com")
+    refute changed?(changeset, :body, from: nil)
+
+    # :to and :from
+    assert changed?(changeset, :title, from: "", to: "title")
+    refute changed?(changeset, :title, from: "wrong", to: "title")
+    refute changed?(changeset, :title, from: "", to: "wrong")
+
+    # invalid field
+    assert_raise ArgumentError, fn ->
+      changed?(changeset, :invalid_field)
+    end
+
+    # association with :to or :from
+    assert_raise ArgumentError, fn ->
+      changed?(changeset, :comment, to: change(%Comment{}, %{}))
+    end
+
+    assert_raise ArgumentError, fn ->
+      changed?(changeset, :comment, from: change(%Comment{}, %{}))
     end
   end
 
@@ -1334,6 +1426,34 @@ defmodule Ecto.ChangesetTest do
     assert changeset.errors == [topics: {"yada", count: 10, validation: :length, kind: :is, type: :list}]
   end
 
+  test "validate_length/3 with map" do
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-1"}}) |> validate_length(:seo_metadata, min: 2, max: 3)
+    assert changeset.valid?
+    assert changeset.errors == []
+    assert validations(changeset) == [seo_metadata: {:length, [min: 2, max: 3]}]
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-2"}}) |> validate_length(:seo_metadata, min: 2, max: 2)
+    assert changeset.valid?
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-3"}}) |> validate_length(:seo_metadata, is: 2)
+    assert changeset.valid?
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-4"}}) |> validate_length(:seo_metadata, min: 3)
+    refute changeset.valid?
+    assert changeset.errors == [seo_metadata: {"should have at least %{count} item(s)", count: 3, validation: :length, kind: :min, type: :map}]
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-5", "is_indexed" => false}}) |> validate_length(:seo_metadata, max: 2)
+    refute changeset.valid?
+    assert changeset.errors == [seo_metadata: {"should have at most %{count} item(s)", count: 2, validation: :length, kind: :max, type: :map}]
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-6", "is_indexed" => false}}) |> validate_length(:seo_metadata, is: 10)
+    refute changeset.valid?
+    assert changeset.errors == [seo_metadata: {"should have %{count} item(s)", count: 10, validation: :length, kind: :is, type: :map}]
+
+    changeset = changeset(%{"seo_metadata" => %{"keywords" => ["foo", "bar"], "slug" => "my-post-7", "is_indexed" => false}}) |> validate_length(:seo_metadata, is: 10, message: "yada")
+    assert changeset.errors == [seo_metadata: {"yada", count: 10, validation: :length, kind: :is, type: :map}]
+  end
+
   test "validate_length/3 with associations" do
     post = %Post{comments: [%Comment{id: 1}]}
     changeset = change(post) |> put_assoc(:comments, []) |> validate_length(:comments, min: 1)
@@ -1680,6 +1800,15 @@ defmodule Ecto.ChangesetTest do
 
       assert Macro.to_string(query_expr) == "is_nil(&0.published_at())"
       assert Macro.to_string(check_expr) == "&0.body() == ^0"
+    end
+
+    test "accepts nulls_distinct option" do
+      cs = changeset(%Post{title: nil, body: "hi", color: "red"}, %{body: nil})
+      unsafe_validate_unique(cs, [:body, :title, :color], MockRepo, nulls_distinct: false)
+      assert_receive [MockRepo, function: :exists?, query: %Ecto.Query{wheres: wheres}, opts: []]
+      assert [%{expr: check_expr}] = wheres
+
+      assert Macro.to_string(check_expr) == "true and is_nil(&0.body()) and is_nil(&0.title()) and &0.color() == ^0"
     end
 
     test "generates correct where clause for single primary key without query option for loaded schema" do

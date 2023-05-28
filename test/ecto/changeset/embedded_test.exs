@@ -39,12 +39,20 @@ defmodule Ecto.Changeset.EmbeddedTest do
 
     schema "posts" do
       field :title, :string
+      field :position, :integer
     end
 
     def changeset(schema, params) do
       cast(schema, params, ~w(title)a)
       |> validate_required(:title)
       |> validate_length(:title, min: 3)
+    end
+
+    def changeset_with_position(schema, params, position) do
+      cast(schema, params, ~w(title)a)
+      |> validate_required(:title)
+      |> validate_length(:title, min: 3)
+      |> put_change(:position, position)
     end
 
     def optional_changeset(schema, params) do
@@ -78,6 +86,12 @@ defmodule Ecto.Changeset.EmbeddedTest do
     def set_action(schema, params) do
       changeset(schema, params)
       |> Map.put(:action, Map.get(params, :action, :update))
+    end
+
+    def changeset_with_position(schema, params, _position) do
+      cast(schema, params, ~w(name id)a)
+      |> validate_required(:name)
+      |> validate_length(:name, min: 3)
     end
   end
 
@@ -430,6 +444,44 @@ defmodule Ecto.Changeset.EmbeddedTest do
     assert changeset.valid?
   end
 
+  test "cast embeds_many with map and sort_param and delete_param" do
+    posts = %{1 => %{"title" => "one"}, 2 => %{"title" => "two"}, 3 => %{"title" => "three"}}
+    opts = [sort_param: :sort, drop_param: :drop]
+
+    changeset = cast(%Author{}, %{"posts" => posts}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(one two three)
+
+    changeset = cast(%Author{}, %{"posts" => posts, "drop" => [2]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+
+    changeset = cast(%Author{}, %{posts: posts, drop: [2]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+
+    changeset = cast(%Author{}, %{"posts" => posts, "sort" => [2, 3, 1]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(two three one)
+
+    changeset = cast(%Author{}, %{sort: ["new"]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == [nil]
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [2, 3, 1]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(two three one)
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [2]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ~w(two one three)
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [2, "new"]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["two", nil, "one", "three"]
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [3, 2, 1], drop: [2]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["three", "one"]
+
+    changeset = cast(%Author{}, %{posts: posts, sort: [1, "new"], drop: [2, "new"]}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "three"]
+
+    changeset = cast(%Author{}, %{posts: posts, sort: :x, drop: :y}, :posts, opts)
+    assert Enum.map(changeset.changes.posts, & &1.changes[:title]) == ["one", "two", "three"]
+  end
+
   test "cast embeds_many with custom changeset" do
     changeset = cast(%Author{}, %{"posts" => [%{"title" => "hello"}]},
                      :posts, with: &Post.optional_changeset/2)
@@ -579,15 +631,19 @@ defmodule Ecto.Changeset.EmbeddedTest do
     refute changeset.valid?
   end
 
-  test "cast inline embeds_many with valid params" do
-    changeset = cast(%Author{}, %{"inline_posts" => [%{"title" => "hello"}]},
-      :inline_posts, with: &Post.changeset/2)
-    [post] = changeset.changes.inline_posts
-    assert post.changes == %{title: "hello"}
-    assert post.errors == []
-    assert post.action  == :insert
-    assert post.valid?
-    assert changeset.valid?
+  test "argument error when casting embeds_one with arity 3 function" do
+    assert_raise(ArgumentError, ~r/invalid \:with function for relation \:profile/, fn ->
+      params = %{"profile" => %{"name" => "John"}}
+      cast(%Author{}, params, :profile, with: &Profile.changeset_with_position/3)
+    end)
+  end
+
+  test "sends index when casting embeds_many with arity 3 function" do
+    changeset = cast(%Author{}, %{"posts" => [%{"title" => "hello"}, %{"title" => "bye"}]},
+      :posts, with: &Post.changeset_with_position/3)
+    [post, post2] = changeset.changes.posts
+    assert post.changes == %{title: "hello", position: 0}
+    assert post2.changes == %{title: "bye", position: 1}
   end
 
   ## Others
@@ -995,12 +1051,14 @@ defmodule Ecto.Changeset.EmbeddedTest do
       |> Changeset.change
       |> Changeset.put_embed(:profile, profile_changeset)
     assert Changeset.get_field(changeset, :profile) == profile
+    assert Changeset.get_change(changeset, :profile) == %{profile_changeset | action: :insert}
     assert Changeset.fetch_field(changeset, :profile) == {:changes, profile}
     assert Changeset.get_embed(changeset, :profile, :changeset) == %{profile_changeset | action: :insert}
     assert Changeset.get_embed(changeset, :profile, :struct) == profile
 
     changeset = Changeset.change(%Author{profile: profile})
     assert Changeset.get_field(changeset, :profile) == profile
+    assert Changeset.get_change(changeset, :profile) == nil
     assert Changeset.fetch_field(changeset, :profile) == {:data, profile}
     assert Changeset.get_embed(changeset, :profile, :changeset) == Changeset.change(profile)
     assert Changeset.get_embed(changeset, :profile, :struct) == profile

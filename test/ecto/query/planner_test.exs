@@ -8,6 +8,29 @@ defmodule Ecto.Query.PlannerTest do
   alias Ecto.Query.Planner
   alias Ecto.Query.JoinExpr
 
+  defmodule CustomMap do
+      use Ecto.Type
+      def type,      do: :map
+      def load(_),   do: {:ok, :load}
+      def dump(_),   do: {:ok, :dump}
+      def cast(_),   do: {:ok, :cast}
+      def equal?(true, _), do: true
+      def equal?(_, _), do: false
+      def embed_as(_), do: :dump
+    end
+
+  defmodule Custom do
+    use Ecto.Schema
+
+    schema "custom" do
+      field :custom_map, CustomMap
+
+      embeds_one :custom_embed, CustomEmbed do
+        field :nested_custom_map, CustomMap
+      end
+    end
+  end
+
   defmodule Comment do
     use Ecto.Schema
 
@@ -68,6 +91,20 @@ defmodule Ecto.Query.PlannerTest do
     end
   end
 
+  defmodule ParameterizedMap do
+    use Ecto.ParameterizedType
+    def init(opts), do: Enum.into(opts, %{})
+    def type(_), do: :map
+
+    def cast(data, _) do
+      {:ok, data}
+    end
+
+    def dump(data, _, _), do: {:ok, data}
+
+    def load(data, _, _), do: {:ok, data}
+  end
+
   defmodule Post do
     use Ecto.Schema
 
@@ -83,6 +120,7 @@ defmodule Ecto.Query.PlannerTest do
       field :prefs, {:map, :string}, source: :preferences
       field :payload, :map, load_in_query: false
       field :status, Ecto.Enum, values: [:draft, :published, :deleted]
+      field :parameterized_map, ParameterizedMap
 
       embeds_one :meta, PostMeta
       embeds_many :metas, PostMeta
@@ -461,7 +499,7 @@ defmodule Ecto.Query.PlannerTest do
 
   test "plan: generates a cache key" do
     {_query, _cast_params, _dump_params, key} = plan(from(Post, []))
-    assert key == [:all, {:from, {"posts", Post, 32915161, "my_prefix"}, []}]
+    assert key == [:all, {:from, {"posts", Post, 111065921, "my_prefix"}, []}]
 
     query =
       from(
@@ -487,7 +525,7 @@ defmodule Ecto.Query.PlannerTest do
                    {:limit, {true, 1}},
                    {:where, [{:and, {:is_nil, [], [nil]}}, {:or, {:is_nil, [], [nil]}}]},
                    {:join, [{:inner, {"comments", Comment, 38292156, "world"}, true, ["join hint"]}]},
-                   {:from, {"posts", Post, 32915161, "hello"}, ["hint"]},
+                   {:from, {"posts", Post, 111065921, "hello"}, ["hint"]},
                    {:select, 1}]
   end
 
@@ -1180,6 +1218,9 @@ defmodule Ecto.Query.PlannerTest do
     query = from(p in "posts", select: json_extract_path(p.metas, ^["not_index", "unknown_field"]))
     normalize(query)
 
+    query = from(Post, []) |> select([p], p.parameterized_map["foo"])
+    normalize(query)
+
     assert_raise RuntimeError, "expected field `title` to be an embed or a map, got: `:string`", fn ->
       query = from(Post, []) |> select([p], p.title["foo"])
       normalize(query)
@@ -1219,6 +1260,59 @@ defmodule Ecto.Query.PlannerTest do
       |> normalize()
 
     assert inspect(normalized_query) =~ "where: p0.preferences[\"field\"] == \"value\", select: p0.preferences[\"field\"]>"
+  end
+
+  test "normalize: json_extract_path with field having custom map type" do
+    normalized_query =
+      Custom
+      |> where([c], c.custom_map["field"] == "value")
+      |> select([c], [c.custom_map["field"], c.custom_embed["nested_custom_map"]["field"]])
+      |> normalize()
+
+    assert inspect(normalized_query) =~
+             "where: c0.custom_map[\"field\"] == \"value\", select: [c0.custom_map[\"field\"], c0.custom_embed[\"nested_custom_map\"][\"field\"]]>"
+  end
+
+  test "normalize: json_extract_path with as/1" do
+    normalized_query =
+      Comment
+      |> join(:inner, [_], p in Post, as: :post, on: true)
+      |> where([p], as(:post).prefs["field"] == "value")
+      |> normalize()
+
+    assert inspect(normalized_query) =~ "where: p1.preferences[\"field\"] == \"value\""
+
+    normalized_query =
+      Comment
+      |> join(:inner, [_], p in Post, as: :post, on: true)
+      |> where([p], json_extract_path(as(:post).prefs, ["field"]) == "value")
+      |> normalize()
+
+    assert inspect(normalized_query) =~ "where: p1.preferences[\"field\"] == \"value\""
+  end
+
+  test "normalize: json_extract_path with parent_as/1" do
+    subquery =
+      Comment
+      |> where([c], c.post_id == parent_as(:post).prefs["field"])
+
+    normalized_query =
+      from(Post, as: :post)
+      |> join(:inner, [_], s in subquery(subquery), on: true)
+      |> normalize()
+
+    assert inspect(normalized_query) =~ "where: c0.post_id == parent_as(:post).preferences[\"field\"]"
+
+    subquery =
+      Comment
+      |> where([c], c.post_id == json_extract_path(parent_as(:post).prefs, ["field"]))
+
+    normalized_query =
+      from(Post, as: :post)
+      |> join(:inner, [_], s in subquery(subquery), on: true)
+      |> normalize()
+
+    assert inspect(normalized_query) =~ "where: c0.post_id == parent_as(:post).preferences[\"field\"]"
   end
 
   test "normalize: flattens and expands right side of in expressions" do
@@ -1326,16 +1420,16 @@ defmodule Ecto.Query.PlannerTest do
     assert query.select.expr ==
              {:&, [], [0]}
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0)
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0)
 
     query = from(Post, []) |> select([p], {p, p.title, "Post"}) |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            [{{:., [type: :string], [{:&, [], [0]}, :post_title]}, [], []}]
 
     query = from(Post, []) |> select([p], {p.title, p, "Post"}) |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            [{{:., [type: :string], [{:&, [], [0]}, :post_title]}, [], []}]
 
     query =
@@ -1345,7 +1439,7 @@ defmodule Ecto.Query.PlannerTest do
       |> select([p, _], {p.title, p})
       |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            select_fields([:id, :text, :posted, :uuid, :crazy_comment, :post_id, :crazy_post_id], 1) ++
            [{{:., [type: :string], [{:&, [], [0]}, :post_title]}, [], []}]
   end
@@ -1407,7 +1501,7 @@ defmodule Ecto.Query.PlannerTest do
       |> select([p, c], {p, struct(c, [:id, :text])})
       |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            select_fields([:id, :text], 1)
   end
 
@@ -1462,7 +1556,7 @@ defmodule Ecto.Query.PlannerTest do
       |> select([p, c], {p, map(c, [:id, :text])})
       |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            select_fields([:id, :text], 1)
   end
 
@@ -1510,11 +1604,11 @@ defmodule Ecto.Query.PlannerTest do
     query = Post |> select([p], %{p | title: "foo"}) |> normalize()
     assert query.select.expr == {:%{}, [], [{:|, [], [{:&, [], [0]}, [title: "foo"]]}]}
     assert query.select.fields ==
-      select_fields([:id, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0)
+      select_fields([:id, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0)
 
     query = Post |> select([p], {%{p | title: "foo"}, p.title}) |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            [{{:., [type: :string], [{:&, [], [0]}, :post_title]}, [], []}]
 
     query =
@@ -1523,7 +1617,7 @@ defmodule Ecto.Query.PlannerTest do
       |> select([p, c], {p, %{c | text: "bar"}})
       |> normalize()
     assert query.select.fields ==
-           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :meta, :metas], 0) ++
+           select_fields([:id, :post_title, :text, :code, :posted, :visits, :links, :preferences, :status, :parameterized_map, :meta, :metas], 0) ++
            select_fields([:id, :posted, :uuid, :crazy_comment, :post_id, :crazy_post_id], 1)
   end
 

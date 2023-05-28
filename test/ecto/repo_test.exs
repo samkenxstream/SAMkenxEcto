@@ -317,6 +317,13 @@ defmodule Ecto.RepoTest do
       assert query.from.source == {"my_parent", Ecto.RepoTest.MyParent}
       assert query.prefix == "fallback_schema"
     end
+
+    test "raises if options aren't a keyword list" do
+      assert_raise FunctionClauseError, fn ->
+        {:ok, _pid} = DefaultOptionRepo.start_link(url: "ecto://user:pass@local/hello")
+        DefaultOptionRepo.all(MySchema, [1])
+      end
+    end
   end
 
   describe "aggregate" do
@@ -348,6 +355,22 @@ defmodule Ecto.RepoTest do
 
     test "aggregates handle a prefix option" do
       TestRepo.aggregate(MySchema, :min, :id, prefix: "public")
+      assert_received {:all, query}
+      assert query.prefix == "public"
+    end
+
+    test "aggregate/3 respects parent query prefix" do
+      query = from(m in MySchema, limit: 1) |> put_query_prefix("public")
+      TestRepo.aggregate(query, :count)
+
+      assert_received {:all, query}
+      assert query.prefix == "public"
+    end
+
+    test "aggregate/4 respects parent query prefix" do
+      query = from(m in MySchema, limit: 1) |> put_query_prefix("public")
+      TestRepo.aggregate(query, :count, :id)
+
       assert_received {:all, query}
       assert query.prefix == "public"
     end
@@ -536,8 +559,6 @@ defmodule Ecto.RepoTest do
     end
 
     test "takes query as datasource with literals" do
-      import Ecto.Query
-
       threshold = "ten"
 
       query = from s in MySchema,
@@ -555,6 +576,24 @@ defmodule Ecto.RepoTest do
       assert ["ten"] = params
     end
 
+    test "takes query selecting on struct" do
+      query = from s in MySchema,
+        select: struct(s, [:foo, :bar])
+
+      TestRepo.insert_all(MySchema, query)
+
+      assert_received {:insert_all, %{source: "my_schema"}, {%Ecto.Query{}, _params}}
+    end
+
+    test "takes query selecting on map" do
+      query = from s in MySchema,
+        select: map(s, [:foo, :bar])
+
+      TestRepo.insert_all(MySchema, query)
+
+      assert_received {:insert_all, %{source: "my_schema"}, {%Ecto.Query{}, _params}}
+    end
+
     test "raises when a bad query is given as source" do
       assert_raise ArgumentError, fn ->
         TestRepo.insert_all(MySchema, from(s in MySchema))
@@ -562,6 +601,10 @@ defmodule Ecto.RepoTest do
       assert_raise ArgumentError, fn ->
         source = from s in MySchema,
           select: s.x
+        TestRepo.insert_all(MySchema, source)
+      end
+      assert_raise Ecto.QueryError, fn ->
+        source = from s in MySchema, select: map(s, [])
         TestRepo.insert_all(MySchema, source)
       end
     end
